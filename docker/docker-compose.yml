@@ -5,7 +5,7 @@ name: arqui_coleta_dados_unipe
 
 services:
   minio:
-    image: minio/minio
+    image: ghcr.io/coollabsio/minio
     container_name: minio
     environment:
       MINIO_ROOT_USER: ${MINIO_USER}
@@ -16,11 +16,7 @@ services:
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+
     restart: unless-stopped
 
   postgres:
@@ -33,11 +29,7 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./initdb:/docker-entrypoint-initdb.d:ro     # roda só na 1a criação do volume
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d serving"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
+
     mem_limit: 512m
 
   metabase:
