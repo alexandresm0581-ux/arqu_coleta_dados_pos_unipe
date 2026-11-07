@@ -52,6 +52,13 @@ Tabelas publicadas no PostgreSQL, no schema gold:
 - gold.clientes_360 - Visao 360 de cada cliente
 - gold.avaliacoes_resumo - Resumo das avaliacoes dos produtos
 
+## Evidências e Entregas
+
+Arquivos de entrega das Partes 2 e 3:
+
+- [Evidências - Projeto Final](./Evidências%20-%20Projeto%20Final.xlsx)
+- [Respostas - Projeto Final](./Respostas%20-%20Projeto%20Final.txt)
+
 ## Tecnologias
 
 Python 3.11, PySpark 3.5.3, Apache Iceberg, MinIO, PostgreSQL 16, Docker, Docker Compose, Jupyter Notebook
