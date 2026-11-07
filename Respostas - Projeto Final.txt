@@ -1,0 +1,163 @@
+===================================
+
+PARTE 2:
+
+===================================
+
+1. Listagem de objetos da Landing e do Warehouse + Experimento da "pasta"
+
+A arquitetura foi executada com Spark 3.5.3, storage em MinIO e catálogo Iceberg. Na Landing foram listados os arquivos brutos ingeridos. No Warehouse foram listados os namespaces bronze, silver e gold no Iceberg.
+Experimento da "pasta": foi demonstrado que no object storage não existem pastas reais, apenas chaves com prefixos. Ao criar um objeto a/b/c.csv e renomear a "pasta", foi necessário renomear objeto por objeto, pois o prefixo faz parte do nome da chave. Isso comprova que a organização é lógica, por prefixo, e não hierárquica como em um sistema de arquivos.
+
+
+2. Contagem de linhas por tabela e reexecução sem duplicar (idempotência).
+
+A contagem foi validada após a carga e após a reexecução do mesmo lote.Exemplo validado na Silver:
+
+silver.itens_pedido_aula: 50.105 linhas após a carga correta;
+
+Após reexecutar o mesmo lote, a contagem permaneceu 50.105, sem duplicação, comprovando idempotência por overwrite / chave do lote e controle de snapshot.
+
+
+
+3. Resumo da construção, quarentena por origem e reconciliação:
+
+Resumo da construção Silver: Bronze -> Silver com limpeza, validação e segregação de rejeitados para lake.quarentena.rejeicoes. Quarentena total: 68 registros.
+
+Origem / Regra                                     Qtde.
+
+Itens de pedidos órfãos - pedido inexistente       40
+Avaliações com nota inválida 			   25
+Produtos com preço negativo			   03
+Total					 	   68
+
+
+Reconciliação: Entrada = Silver + Quarentena. A conta fechou em todas as tabelas, ou seja, nenhum registro foi perdido silenciosamente. Tudo que saiu da Bronze foi para a Silver ou foi justificado na quarentena.
+
+
+
+4. Relatório de DQ e tabela dq_resultados:
+
+Foram executadas 8 regras de Data Quality, registradas em lake.silver.dq_resultados:
+
+7 regras com status OK e 0 falhas;
+1 regra com status AVISO: email nulo em clientes - 270 registros / 5,4% da base.
+
+O aviso não bloqueou o pipeline, pois o e-mail não é chave de negócio para vendas, mas foi registrado como dívida de qualidade para ação posterior.
+
+
+
+
+5. Erro simulado e recuperação da versão anterior:
+
+Erro simulado: DELETE indevido de pedidos cancelados em silver.itens_pedido_aula.
+
+Antes: 50.105 linhas;
+Após o DELETE errado: 43.886 linhas;
+Perda simulada: 6.219 linhas.
+
+Recuperação:
+Time Travel com VERSION AS OF {snap_bom} provou que a versão antiga ainda tinha 50.105 linhas, apenas lendo, sem restaurar;
+rollback_to_snapshot('silver.itens_pedido_aula', {snap_bom}) restaurou a tabela;
+Após o rollback: 50.105 linhas novamente, em 0,7s.
+
+Histórico do Iceberg manteve 5 snapshots, permitindo auditoria completa.
+
+
+
+6. Tabela de gates, três tabelas publicadas e contrato de dados:
+
+Tabela de gates: todos os itens OK para promoção Silver -> Gold.
+
+Três tabelas Gold publicadas a partir da Silver:
+
+Tabela Gold            Linhas
+
+vendas diárias	       30.129
+clientes_360	       5.000
+avaliacoes_resumo      112
+
+
+Contrato de dados: clientes_360 tem 5.000 linhas, exatamente igual ao número de clientes da Silver, garantindo 1 linha por cliente, sem duplicação nem perda. Segmentação validada: ativo 1.713, campeão 1.656, em_risco 640, sem_compra 515, inativo 476. Total = 5.000.As 3 tabelas foram publicadas no Postgres no schema gold: gold.vendas_diarias, gold.clientes_360, gold.avaliacoes_resumo.
+
+
+
+7. Tabelas Gold no Postgres e pergunta de negócio no Metabase:
+
+Pergunta de negócio respondida: Receita por categoria:
+
+SELECT categoria, round(sum(receita)) AS receita
+FROM gold.vendas_diarias
+GROUP BY 1 ORDER BY 2 DESC LIMIT 5
+
+Categoria             Receita
+
+Alimentos	      8.753.116
+Eletrônicos	      8.380.779
+Moda		      7.896.713
+Esporte		      7.786.758
+Casa		      7.493.598
+
+Conclusão de negócio: Alimentos lidera, mas a receita é bem distribuída, a diferença entre o 1º e o 5º é de apenas ∼16%, sem domínio de uma única categoria.
+
+
+===================================
+
+PARTE 3:
+
+===================================
+
+
+1. Qual regra da Silver mandou mais registros para a quarentena e por quê?
+
+A regra que mais mandou registros para a quarentena foi a de integridade referencial de itens de pedido: pedido inexistente, com 40 dos 68 registros (58,8%). Ela aconteceu porque 40 itens de pedido referenciavam um pedido_id que não existe na tabela de pedidos. Um exemplo de falha na origem: pedido cancelado / excluído na fonte, erro de integração, ou carga fora de ordem entre pedidos e itens. Eu não podia deixar esses registros irem para a Silver, porque eles quebrariam qualquer join de vendas e inflariam a receita com itens sem pedido. Por isso eles foram para a quarentena para investigação, e não apagados. As outras regras foram menores: 25 avaliações com nota inválida e 3 produtos com preço negativo.
+
+
+
+2. Se a reconciliação não fechasse, o que você investigaria primeiro?
+
+Eu investigaria primeiro a quarentena e a definição de entrada. A fórmula: Entrada = Silver + Quarentena. Não fechando, seguem as hipóteses mais prováveis:
+
+Filtro a mais na Silver: alguma regra de limpeza descartando registro sem mandar para a quarentena;
+
+Duplicação na entrada: reexecução do lote sem idempotência, ou join duplicando linhas na Silver;
+
+Contagem em momento diferente: alguém / algum job alterando a tabela entre as duas contagens, como aconteceu no meu teste de DELETE.
+
+Na prática, eu faria: comparar contagem por origem / lote, conferir o snapshot_id do Iceberg no momento da contagem, e listar os ids que estão na entrada e não estão nem na Silver nem na quarentena. Esse diff por chave mostra exatamente onde vazou.
+
+
+
+3. Que dado pessoal existe na sua arquitetura e como ele foi tratado?
+
+Na minha arquitetura, o dado pessoal está na tabela de clientes, principalmente nome e e-mail.
+
+Tratamento aplicado:
+
+Restrito: nome e e-mail ficam apenas na camada Silver, com acesso restrito. Eles não são chave de negócio e não precisam ir para todas as tabelas;
+
+Não publicado na Gold analítica: a Gold vendas_diarias e avaliacoes_resumo são agregadas e não carregam dado pessoal. A clientes_360 é agregada por cliente para segmentação, para uso interno, e não expõe e-mail em dashboard público;
+
+Qualidade monitorada: foi identificado que 270 clientes (5,4%) estão sem e-mail, registrado como AVISO no DQ. Isso não é dado removido, é dado ausente na origem, e foi documentado em vez de inventado / preenchido com valor falso;
+
+Sem exposição em logs / quarentena: a quarentena guarda motivo e chave, não cópia de dado pessoal desnecessário.
+
+Ou seja: minimização, restrição de acesso e não exposição em camada de consumo.
+
+
+
+4. O que você mudaria nesta arquitetura se o volume fosse 1.000 vezes maior?
+
+Hoje a arquitetura roda em local[2] com MinIO local, o que funciona para prova de conceito. Com 1.000x o volume, eu mudaria 4 coisas:
+
+Computação: sair de local[2] para um cluster Spark distribuído, com autoscaling, e particionar as tabelas Iceberg por data e categoria, para não varrer a tabela inteira a cada query;
+
+Ingestão: trocar carga em lote única por ingestão incremental / streaming, com controle de watermark e idempotência por lote_id, e compactação e vacuum agendados no Iceberg para não acumular milhares de arquivos pequenos;
+
+Qualidade e gates: rodar DQ de forma amostral + regras críticas em 100%, e gates automáticos que bloqueiam a promoção para Gold se falhar, em vez de verificação manual;
+
+Serving: manter o Postgres apenas para agregados Gold pequenos. O dado detalhado ficaria no Lakehouse, com cache / modelo no Metabase, e controle de acesso por papel para dado pessoal.
+
+
+A lógica Bronze -> Silver -> Gold não mudaria. O que mudaria é escala, particionamento, orquestração e automação.
+
